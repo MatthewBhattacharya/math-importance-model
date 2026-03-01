@@ -120,12 +120,12 @@ Directed; stored as adjacency lists on each Theorem. Ground truth is fixed once 
 
 | ID | File | Decision | Alternatives |
 |---|---|---|---|
-| **MD-D1** | `dynamics.py` | Selection score: **importance\_mean / (1 + scale × dist)** | Softmax sampling; include difficulty |
+| **MD-D1** | `dynamics.py` | Selection score: **importance\_mean − scale × dist** (linear subtraction, correct for negative beliefs) | Softmax sampling; include difficulty |
 | **MD-D2** | `dynamics.py` | Work on **PROBLEMS\_PER\_STEP = 2** theorems per step | Ability-proportional count |
 | **MD-D3** | `dynamics.py` | Success prob: **sigmoid(scale×(ability−diff) − penalty×dist)** using **ground-truth difficulty** | Use belief about difficulty; add noise |
 | **MD-D4** | `dynamics.py` | Link discovery: **sigmoid(ability·s − dist\_penalty·(d1+d2) − diff\_penalty·\|gap\| + bias)** | Require working on both theorems |
 | **MD-D5** | `dynamics.py` | Difficulty update: **pseudo-obs = ability − dist\_penalty×dist ± failure\_offset**; larger noise on failure | Probit/EP exact update |
-| **MD-D6** | `dynamics.py` | On discovering T1→T2: update T2 difficulty toward **T1 difficulty − offset** | No difficulty update from link discovery |
+| **MD-D6** | `dynamics.py` | On discovering T1→T2: update T2 difficulty toward **T1 difficulty − LINK\_DIFFICULTY\_OFFSET** (separate constant from FAILURE\_OFFSET) | No difficulty update from link discovery |
 
 ### Dynamics — Phase 2 (Communication)
 
@@ -141,7 +141,7 @@ Directed; stored as adjacency lists on each Theorem. Ground truth is fixed once 
 | ID | File | Decision | Alternatives |
 |---|---|---|---|
 | **MD-S1** | `dynamics.py` | Theorem spawn count: **max(1, round(THEOREM\_SPAWN\_RATE × n\_math))** | Fixed count; event-driven |
-| **MD-S2** | `dynamics.py` | Mathematician spawn count: **max(0, round(MATHEMATICIAN\_SPAWN\_RATE × n\_math))** | Fixed count |
+| **MD-S2** | `dynamics.py` | Mathematician spawn count: **Poisson(MATHEMATICIAN\_SPAWN\_RATE × n\_math)** — avoids always-zero for small populations | Fixed count |
 | **MD-S3** | `dynamics.py` | New theorem location: **Uniform([0,1]²)** | Cluster near active theorems |
 | **MD-S4** | `dynamics.py` | New theorem difficulty: **N(DIFFICULTY\_MEAN, DIFFICULTY\_STD²)** | Sample from existing distribution |
 | **MD-S5** | `dynamics.py` | Implication probability: **sigmoid(diff\_gap·scale) × exp(−dist·decay)** | Fixed threshold |
@@ -181,6 +181,7 @@ Directed; stored as adjacency lists on each Theorem. Ground truth is fixed once 
 | `IMPLICATION_MAX_DIST` | 0.4 | MD-C27 | Max distance for new implication creation |
 | `IMPLICATION_DISTANCE_DECAY` | 4.0 | MD-C28 | Distance decay for implication probability |
 | `IMPLICATION_DIFF_SCALE` | 1.0 | MD-C29 | Sigmoid scale for difficulty gap in implication |
+| `LINK_DIFFICULTY_OFFSET` | 1.0 | MD-C30 | Expected difficulty gap between T1 and T2 when T1→T2 discovered |
 
 ---
 

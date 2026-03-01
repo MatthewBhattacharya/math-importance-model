@@ -22,8 +22,11 @@ through three sequential phases:
 #
 # --- Phase 1: Problem selection ---
 # MD-D1: SELECTION SCORE FUNCTION
-#   score(T) = importance_belief_mean(T) / (1 + SELECTION_DISTANCE_SCALE * dist(M, T))
+#   score(T) = importance_belief_mean(T) − SELECTION_DISTANCE_SCALE * dist(M, T)
 #   Mathematicians prefer theorems they believe important AND nearby.
+#   Linear subtraction is used (not division) so that negative importance beliefs
+#   still rank correctly — division would invert the preference when the numerator
+#   is negative.
 #   Alternative: softmax sampling instead of argmax; include difficulty in score.
 #
 # MD-D2: PROBLEMS PER STEP (see params.py MD-C07)
@@ -63,9 +66,11 @@ through three sequential phases:
 #
 # --- Phase 1: Difficulty update from link discovery ---
 # MD-D6: IF T1→T2 IS DISCOVERED, UPDATE DIFFICULTY BELIEF FOR T2
-#   pseudo_obs = mathematician's own difficulty_belief(T1).mu − LINK_DIFF_PRIOR_OFFSET
-#   Rationale: knowing T1 implies T2 (and T1 ≥ T2 in difficulty) provides
+#   pseudo_obs = difficulty_belief(T1).mu − LINK_DIFFICULTY_OFFSET  (params.py MD-C30)
+#   Rationale: knowing T1 implies T2 (and T1 ≥ T2 in difficulty by MD-T6) provides
 #   evidence that T2 is somewhat easier than T1.
+#   LINK_DIFFICULTY_OFFSET is a separate constant from FAILURE_OFFSET — they are
+#   conceptually distinct (one is about implication structure, one about proof outcomes).
 #   Alternative: no update; leave T2's difficulty belief unchanged.
 #
 # --- Phase 2: Peer ability update ---
@@ -102,7 +107,10 @@ through three sequential phases:
 #   n_new = max(1, round(THEOREM_SPAWN_RATE * n_mathematicians))
 #
 # MD-S2: MATHEMATICIAN SPAWN COUNT (see params.py MD-C20)
-#   n_new = max(0, round(MATHEMATICIAN_SPAWN_RATE * n_mathematicians))
+#   n_new ~ Poisson(MATHEMATICIAN_SPAWN_RATE * n_mathematicians)
+#   Poisson sampling is used instead of round() so that fractional expected
+#   values (e.g. 0.1 * 3 = 0.3) still produce occasional spawns in small
+#   populations. round() would silently give 0 for any expectation < 0.5.
 #
 # MD-S3: NEW THEOREM LOCATION (see params.py MD-C21, MD-C22)
 #   location = Uniform([0,1]²)
@@ -172,11 +180,17 @@ def _phase_proof_attempts(
 
         # ---- Problem selection (MD-D1, MD-D2) ----
         def selection_score(tid: str) -> float:
-            """MD-D1: score = importance_mean / (1 + SELECTION_DISTANCE_SCALE * dist)"""
+            """
+            MD-D1: score = importance_mean − SELECTION_DISTANCE_SCALE * dist
+            Linear subtraction keeps ranking correct for negative importance beliefs.
+            (Division by (1 + dist) was incorrect: a negative numerator would invert
+            the ranking, causing mathematicians to prefer theorems they think are
+            least important.)
+            """
             theorem = world.theorems[tid]
             imp = m.theorem_beliefs[tid].importance.mu
             dist = m.distance_to(theorem.location)
-            return imp / (1.0 + params.SELECTION_DISTANCE_SCALE * dist)
+            return imp - params.SELECTION_DISTANCE_SCALE * dist
 
         sorted_tids = sorted(visible_tids, key=selection_score, reverse=True)
         # MD-D2: work on at most PROBLEMS_PER_STEP theorems
@@ -210,31 +224,33 @@ def _phase_proof_attempts(
             m.theorem_beliefs[tid].difficulty.update(pseudo_obs, obs_noise2=noise)
 
             # ---- Link discovery (MD-D4) ----
-            _attempt_link_discovery(world, m, tid, dist, params, rng)
+            _attempt_link_discovery(world, m, tid, params, rng)
 
 
 def _attempt_link_discovery(
     world: MathematicalWorld,
     m: Mathematician,
     worked_on_tid: str,
-    dist_to_worked: float,
     params: SimParams,
     rng: np.random.Generator,
 ) -> None:
     """
     While working on `worked_on_tid`, try to discover undiscovered ground-truth
     implications involving it. MD-D4.
+
+    Note: `dist_to_worked` is NOT forwarded — _try_discover_link computes both
+    distances internally to avoid the bug where the "other" theorem's distance
+    was computed as distance-to-worked instead of distance-to-other.
     """
     theorem = world.theorems[worked_on_tid]
 
     # Check all implied theorems (worked_on → other)
     for target_id in theorem.implies:
-        _try_discover_link(world, m, worked_on_tid, target_id, dist_to_worked, params, rng)
+        _try_discover_link(world, m, worked_on_tid, target_id, params, rng)
 
     # Check all implying theorems (other → worked_on)
     for source_id in theorem.implied_by:
-        _try_discover_link(world, m, source_id, worked_on_tid,
-                           dist_to_worked, params, rng)
+        _try_discover_link(world, m, source_id, worked_on_tid, params, rng)
 
 
 def _try_discover_link(
@@ -242,7 +258,6 @@ def _try_discover_link(
     m: Mathematician,
     source_id: str,
     target_id: str,
-    dist_to_primary: float,
     params: SimParams,
     rng: np.random.Generator,
 ) -> None:
@@ -252,6 +267,11 @@ def _try_discover_link(
     Conditions for discovery attempt:
       - source_id and target_id must both be in the mathematician's theorem_beliefs.
       - The link must not yet be known to the mathematician.
+
+    Both distances are computed here directly. Previously dist_to_primary was
+    passed in from the caller, which caused a bug: when worked_on == target,
+    dist_to_primary was the distance to the target, so both terms in the sum
+    used that same distance instead of one per theorem.
     """
     if source_id not in m.theorem_beliefs or target_id not in m.theorem_beliefs:
         return
@@ -260,13 +280,14 @@ def _try_discover_link(
 
     t_source = world.theorems[source_id]
     t_target = world.theorems[target_id]
-    dist_other = m.distance_to(t_target.location if target_id != source_id else t_source.location)
+    dist_source = m.distance_to(t_source.location)
+    dist_target = m.distance_to(t_target.location)
 
     # MD-D4: sigmoid function of ability, total distance, and difficulty gap
     diff_gap = abs(t_source.difficulty - t_target.difficulty)
     logit = (
         params.LINK_ABILITY_SCALE * m.ability
-        - params.LINK_DISTANCE_PENALTY * (dist_to_primary + dist_other)
+        - params.LINK_DISTANCE_PENALTY * (dist_source + dist_target)
         - params.LINK_DIFF_PENALTY * diff_gap
         + params.LINK_BIAS
     )
@@ -277,11 +298,14 @@ def _try_discover_link(
             generator_id=m.mathematician_id,
         ))
 
-        # MD-D6: update difficulty belief for the implied theorem
+        # MD-D6: update difficulty belief for the implied theorem (target).
+        # Knowing T1→T2 implies T2 is easier than T1 by at least LINK_DIFFICULTY_OFFSET.
+        # Uses params.LINK_DIFFICULTY_OFFSET (MD-C30), NOT FAILURE_OFFSET —
+        # they are conceptually distinct constants.
         if target_id in m.theorem_beliefs:
             pseudo_obs = (
                 m.theorem_beliefs[source_id].difficulty.mu
-                - params.FAILURE_OFFSET  # FAILURE_OFFSET reused as "link diff prior"
+                - params.LINK_DIFFICULTY_OFFSET  # MD-C30
             )
             m.theorem_beliefs[target_id].difficulty.update(
                 pseudo_obs,
@@ -532,8 +556,11 @@ def _spawn_mathematicians(
     if n_math == 0:
         return
 
-    # MD-S2 (MD-C20): spawn count
-    n_new = max(0, round(params.MATHEMATICIAN_SPAWN_RATE * n_math))
+    # MD-S2 (MD-C20): Poisson-sample the spawn count so that fractional
+    # expected values (e.g. 0.1 * 3 = 0.3) still produce occasional spawns.
+    # round() would give 0 for any expectation < 0.5, silencing spawning
+    # entirely for small populations.
+    n_new = int(rng.poisson(params.MATHEMATICIAN_SPAWN_RATE * n_math))
 
     existing_list = list(world.mathematicians.values())
 

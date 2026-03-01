@@ -185,3 +185,11 @@ class SimParams:
     # MD-C29: Sigmoid scale for difficulty difference in implication probability.
     # P(link) ∝ sigmoid(IMPLICATION_DIFF_SCALE * (diff_new − diff_existing)).
     # Larger → implication probability more sensitive to difficulty gap.
+
+    LINK_DIFFICULTY_OFFSET: float = 1.0
+    # MD-C30: When T1→T2 is discovered, T2's difficulty pseudo-observation is
+    #   difficulty_belief(T1).mu − LINK_DIFFICULTY_OFFSET
+    # This encodes the prior that an implied theorem (T2) is expected to be
+    # somewhat easier than the theorem that implies it (T1).
+    # Distinct from FAILURE_OFFSET (which is about proof attempt outcomes).
+    # Larger → T2 is assumed much easier than T1 upon link discovery.
