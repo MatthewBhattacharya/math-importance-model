@@ -65,6 +65,14 @@ through three sequential phases:
 #   Alternative: use difficulty beliefs; require working on both T1 and T2.
 #
 # --- Phase 1: Difficulty update from link discovery ---
+# MD-D7: DISCOVERER UPDATES OWN IMPORTANCE BELIEFS ON LINK DISCOVERY
+#   When M discovers X→Y, M immediately updates her OWN importance beliefs
+#   for X and Y using the same formula as MD-C4, but with sigmoid(m.ability)
+#   as the trust signal (ground-truth ability; no uncertainty about oneself).
+#   Previously, importance updates only propagated via Phase 2 communication,
+#   leaving the discoverer's importance beliefs frozen at the prior.
+#   Alternative: wait for a "self-communication" step; model self-reflection delay.
+#
 # MD-D6: IF T1→T2 IS DISCOVERED, UPDATE DIFFICULTY BELIEF FOR T2
 #   pseudo_obs = difficulty_belief(T1).mu − LINK_DIFFICULTY_OFFSET  (params.py MD-C30)
 #   Rationale: knowing T1 implies T2 (and T1 ≥ T2 in difficulty by MD-T6) provides
@@ -320,6 +328,72 @@ def _try_discover_link(
                 obs_noise2=params.OBS_NOISE_DIFFICULTY,
             )
 
+        # MD-D7: discoverer updates their OWN importance beliefs immediately.
+        # Previously, importance updates only happened via Phase 2 communication,
+        # so a mathematician who discovered X→Y never updated their own importance
+        # beliefs for X or Y — only their neighbours did. Fix: apply the same
+        # importance update to the discoverer in Phase 1, using their ground-truth
+        # ability as the trust signal (no uncertainty about one's own ability).
+        trust_self = max(_sigmoid(m.ability), 0.05)  # MD-D7: ground-truth ability
+        _apply_importance_update(m, source_id, target_id, trust_self, params)
+
+
+# ------------------------------------------------------------------
+# Shared importance-update helper (Phase 1 self-discovery + Phase 2 comms)
+# ------------------------------------------------------------------
+
+def _apply_importance_update(
+    receiver: Mathematician,
+    source_id: str,
+    target_id: str,
+    trust: float,
+    params: SimParams,
+) -> None:
+    """
+    Update `receiver`'s importance beliefs for source_id and target_id,
+    given discovery of the implication source_id → target_id.
+
+    Called from two sites:
+      - Phase 1 (_try_discover_link): discoverer updates their own beliefs.
+        trust = sigmoid(m.ability)  [ground-truth ability, no uncertainty].
+      - Phase 2 (_update_from_link): neighbour hears about the link.
+        trust = sigmoid(ability_belief.mu)  [uncertain estimate of discoverer].
+
+    Bayesian noise (MD-C4): the signal for source's importance is μ_target,
+    which is itself uncertain (σ²_target). Effective noise:
+        eff_noise_source = (OBS_NOISE_IMPORTANCE + σ²_target) / trust
+        eff_noise_target = (OBS_NOISE_IMPORTANCE + CONSEQUENCE_FACTOR² × σ²_source) / trust
+    Old values of both beliefs are captured before either update (no order dependency).
+    """
+    if source_id in receiver.theorem_beliefs and target_id in receiver.theorem_beliefs:
+        # Capture old values — both formulas use pre-update means/variances
+        imp_src_mu    = receiver.theorem_beliefs[source_id].importance.mu
+        imp_src_var   = receiver.theorem_beliefs[source_id].importance.sigma2
+        imp_tgt_mu    = receiver.theorem_beliefs[target_id].importance.mu
+        imp_tgt_var   = receiver.theorem_beliefs[target_id].importance.sigma2
+
+        pseudo_src  = imp_tgt_mu + params.IMPLICATION_BONUS  # MD-C17
+        noise_src   = (params.OBS_NOISE_IMPORTANCE + imp_tgt_var) / trust
+        receiver.theorem_beliefs[source_id].importance.update(pseudo_src, obs_noise2=noise_src)
+
+        pseudo_tgt  = imp_src_mu * params.CONSEQUENCE_FACTOR  # MD-C18
+        noise_tgt   = (params.OBS_NOISE_IMPORTANCE + params.CONSEQUENCE_FACTOR ** 2 * imp_src_var) / trust
+        receiver.theorem_beliefs[target_id].importance.update(pseudo_tgt, obs_noise2=noise_tgt)
+
+    elif source_id in receiver.theorem_beliefs:
+        imp_src_mu  = receiver.theorem_beliefs[source_id].importance.mu
+        imp_src_var = receiver.theorem_beliefs[source_id].importance.sigma2
+        pseudo_src  = imp_src_mu + params.IMPLICATION_BONUS
+        noise_src   = (params.OBS_NOISE_IMPORTANCE + imp_src_var) / trust
+        receiver.theorem_beliefs[source_id].importance.update(pseudo_src, obs_noise2=noise_src)
+
+    elif target_id in receiver.theorem_beliefs:
+        imp_tgt_mu  = receiver.theorem_beliefs[target_id].importance.mu
+        imp_tgt_var = receiver.theorem_beliefs[target_id].importance.sigma2
+        pseudo_tgt  = imp_tgt_mu + params.IMPLICATION_BONUS * params.CONSEQUENCE_FACTOR
+        noise_tgt   = (params.OBS_NOISE_IMPORTANCE + imp_tgt_var) / trust
+        receiver.theorem_beliefs[target_id].importance.update(pseudo_tgt, obs_noise2=noise_tgt)
+
 
 # ------------------------------------------------------------------
 # Phase 2: Communication
@@ -474,48 +548,15 @@ def _update_from_link(
     world.known_implications.add((sid, tid))
 
     # ---- Importance update (MD-C4) ----
+    # Trust is derived from receiver's BELIEF about the discoverer's ability
+    # (uncertain, unlike the self-discovery case in Phase 1 which uses ground truth).
     ability_mu = (
         receiver.peer_beliefs[mid].mu
         if mid in receiver.peer_beliefs
         else params.PRIOR_MU
     )
-    # sigmoid(ability_mu) ∈ (0,1): more trusted discoverer → smaller divisor → lower noise
-    trust = max(_sigmoid(ability_mu), 0.05)  # clamp to avoid division blowup
-
-    if sid in receiver.theorem_beliefs and tid in receiver.theorem_beliefs:
-        # Capture old values before any update (use old μ and σ² for both formulas)
-        imp_source_mu    = receiver.theorem_beliefs[sid].importance.mu
-        imp_source_sigma2 = receiver.theorem_beliefs[sid].importance.sigma2
-        imp_target_mu    = receiver.theorem_beliefs[tid].importance.mu
-        imp_target_sigma2 = receiver.theorem_beliefs[tid].importance.sigma2
-
-        # X's update: observation is "importance(X) ≈ importance(Y) + IMPLICATION_BONUS"
-        # Effective noise includes Y's uncertainty (σ²_Y propagated through) — MD-C4
-        pseudo_source = imp_target_mu + params.IMPLICATION_BONUS  # MD-C17
-        eff_noise_source = (params.OBS_NOISE_IMPORTANCE + imp_target_sigma2) / trust
-        receiver.theorem_beliefs[sid].importance.update(pseudo_source, obs_noise2=eff_noise_source)
-
-        # Y's update: observation is "importance(Y) ≈ importance(X) * CONSEQUENCE_FACTOR"
-        # Effective noise includes X's uncertainty scaled by CONSEQUENCE_FACTOR² — MD-C4
-        pseudo_target = imp_source_mu * params.CONSEQUENCE_FACTOR  # MD-C18
-        eff_noise_target = (params.OBS_NOISE_IMPORTANCE + params.CONSEQUENCE_FACTOR ** 2 * imp_source_sigma2) / trust
-        receiver.theorem_beliefs[tid].importance.update(pseudo_target, obs_noise2=eff_noise_target)
-
-    elif sid in receiver.theorem_beliefs:
-        # Only know source: self-referential boost (implies something exists)
-        imp_source_mu     = receiver.theorem_beliefs[sid].importance.mu
-        imp_source_sigma2 = receiver.theorem_beliefs[sid].importance.sigma2
-        pseudo_source = imp_source_mu + params.IMPLICATION_BONUS
-        eff_noise = (params.OBS_NOISE_IMPORTANCE + imp_source_sigma2) / trust
-        receiver.theorem_beliefs[sid].importance.update(pseudo_source, obs_noise2=eff_noise)
-
-    elif tid in receiver.theorem_beliefs:
-        # Only know target: small boost from knowing something implies it
-        imp_target_mu     = receiver.theorem_beliefs[tid].importance.mu
-        imp_target_sigma2 = receiver.theorem_beliefs[tid].importance.sigma2
-        pseudo_target = imp_target_mu + params.IMPLICATION_BONUS * params.CONSEQUENCE_FACTOR
-        eff_noise = (params.OBS_NOISE_IMPORTANCE + imp_target_sigma2) / trust
-        receiver.theorem_beliefs[tid].importance.update(pseudo_target, obs_noise2=eff_noise)
+    trust = max(_sigmoid(ability_mu), 0.05)
+    _apply_importance_update(receiver, sid, tid, trust, params)
 
 
 # ------------------------------------------------------------------

@@ -127,6 +127,7 @@ Directed; stored as adjacency lists on each Theorem. Ground truth is fixed once 
 | **MD-D4** | `dynamics.py` | Link discovery: **sigmoid(ability·s − dist\_penalty·(d1+d2) − diff\_penalty·\|gap\| + bias)** | Require working on both theorems |
 | **MD-D5** | `dynamics.py` | Difficulty update: **pseudo-obs = ability − dist\_penalty×dist ± failure\_offset**; larger noise on failure | Probit/EP exact update |
 | **MD-D6** | `dynamics.py` | On discovering T1→T2: update T2 difficulty toward **T1 difficulty − LINK\_DIFFICULTY\_OFFSET** (separate constant from FAILURE\_OFFSET) | No difficulty update from link discovery |
+| **MD-D7** | `dynamics.py` | Discoverer **immediately updates their own importance beliefs** on link discovery (Phase 1), using sigmoid(ground-truth ability) as trust. Shared helper with Phase 2 importance update. | Delay until next communication round |
 
 ### Dynamics — Phase 2 (Communication)
 
