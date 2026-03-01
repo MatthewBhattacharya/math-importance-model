@@ -1,6 +1,6 @@
 """
-Basic tests for the skeleton — verifying structural correctness.
-Run with: pytest tests/
+Tests for the math importance model skeleton and dynamics.
+Run with: pytest tests/ -v
 """
 
 import sys, os
@@ -9,42 +9,52 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 import pytest
 
-from model import BetaBelief, Theorem, Mathematician, TheoremBeliefs, MathematicalWorld
+from model import (
+    NormalBelief, Theorem, Mathematician, TheoremBeliefs,
+    MathematicalWorld, SimParams, step,
+)
 
 
 # -----------------------------------------------------------------------
-# BetaBelief
+# NormalBelief
 # -----------------------------------------------------------------------
 
-class TestBetaBelief:
-    def test_default_is_uniform(self):
-        b = BetaBelief()
-        assert b.alpha == 1.0 and b.beta_ == 1.0
-        assert b.mean() == pytest.approx(0.5)
+class TestNormalBelief:
+    def test_default_values(self):
+        b = NormalBelief()
+        assert b.mu == 0.0
+        assert b.sigma2 > 0
 
-    def test_update_shifts_mean(self):
-        b = BetaBelief()
-        b.update(0.0)   # observation = 0
-        assert b.mean() < 0.5
+    def test_update_shifts_mean_upward(self):
+        b = NormalBelief(mu=0.0, sigma2=4.0)
+        b.update(10.0, obs_noise2=1.0)
+        assert b.mu > 0.0
 
-        b2 = BetaBelief()
-        b2.update(1.0)  # observation = 1
-        assert b2.mean() > 0.5
+    def test_update_shifts_mean_downward(self):
+        b = NormalBelief(mu=0.0, sigma2=4.0)
+        b.update(-10.0, obs_noise2=1.0)
+        assert b.mu < 0.0
 
-    def test_update_invalid_observation(self):
-        b = BetaBelief()
+    def test_update_reduces_variance(self):
+        b = NormalBelief(mu=0.0, sigma2=4.0)
+        old_var = b.sigma2
+        b.update(1.0, obs_noise2=1.0)
+        assert b.sigma2 < old_var
+
+    def test_invalid_sigma2(self):
         with pytest.raises(ValueError):
-            b.update(1.5)
+            NormalBelief(sigma2=0.0)
 
-    def test_invalid_params(self):
+    def test_invalid_obs_noise(self):
+        b = NormalBelief()
         with pytest.raises(ValueError):
-            BetaBelief(alpha=0, beta_=1)
+            b.update(0.0, obs_noise2=0.0)
 
     def test_copy_is_independent(self):
-        b = BetaBelief(alpha=2.0, beta_=3.0)
+        b = NormalBelief(mu=1.0, sigma2=2.0)
         c = b.copy()
-        c.update(1.0)
-        assert b.alpha == 2.0  # original unchanged
+        c.update(100.0, obs_noise2=0.01)
+        assert b.mu == pytest.approx(1.0)
 
 
 # -----------------------------------------------------------------------
@@ -52,34 +62,38 @@ class TestBetaBelief:
 # -----------------------------------------------------------------------
 
 class TestTheorem:
-    def make(self, **kwargs):
-        defaults = dict(
-            theorem_id="T", location=np.array([0.5, 0.5]),
-            difficulty=0.5, importance=0.5,
-        )
-        defaults.update(kwargs)
+    def _make(self, **kw):
+        defaults = dict(theorem_id="T", location=np.array([0.5, 0.5]), difficulty=0.5)
+        defaults.update(kw)
         return Theorem(**defaults)
 
     def test_basic_creation(self):
-        t = self.make()
+        t = self._make()
         assert t.theorem_id == "T"
-        assert t.difficulty == 0.5
 
-    def test_out_of_range_difficulty(self):
-        with pytest.raises((AssertionError, ValueError)):
-            self.make(difficulty=1.5)
+    def test_no_importance_field(self):
+        t = self._make()
+        assert not hasattr(t, "importance"), "Theorem must NOT have an importance field"
+
+    def test_difficulty_can_be_negative(self):
+        t = self._make(difficulty=-3.0)
+        assert t.difficulty == -3.0
+
+    def test_difficulty_can_be_large(self):
+        t = self._make(difficulty=100.0)
+        assert t.difficulty == 100.0
 
     def test_distance(self):
-        t = self.make(location=np.array([0.0, 0.0]))
+        t = self._make(location=np.array([0.0, 0.0]))
         assert t.distance_to(np.array([1.0, 0.0])) == pytest.approx(1.0)
 
-    def test_implies_lists(self):
-        t = self.make()
+    def test_location_outside_unit_square_raises(self):
+        with pytest.raises(ValueError):
+            self._make(location=np.array([1.5, 0.5]))
+
+    def test_implies_deduplication(self):
+        t = self._make()
         t._add_implies("T2")
-        t._add_implied_by("T0")
-        assert "T2" in t.implies
-        assert "T0" in t.implied_by
-        # No duplicates
         t._add_implies("T2")
         assert t.implies.count("T2") == 1
 
@@ -89,7 +103,7 @@ class TestTheorem:
 # -----------------------------------------------------------------------
 
 class TestMathematician:
-    def make(self, **kwargs):
+    def _make(self, **kw):
         defaults = dict(
             mathematician_id="M",
             location=np.array([0.5, 0.5]),
@@ -97,24 +111,45 @@ class TestMathematician:
             theorem_radius=0.3,
             peer_radius=0.4,
         )
-        defaults.update(kwargs)
+        defaults.update(kw)
         return Mathematician(**defaults)
 
     def test_basic_creation(self):
-        m = self.make()
+        m = self._make()
         assert m.mathematician_id == "M"
-        assert m.ability == 0.7
 
-    def test_invalid_ability(self):
-        with pytest.raises((AssertionError, ValueError)):
-            self.make(ability=1.5)
+    def test_ability_can_be_negative(self):
+        m = self._make(ability=-1.5)
+        assert m.ability == -1.5
 
-    def test_perception(self):
-        m = self.make(location=np.array([0.5, 0.5]), theorem_radius=0.3)
-        # Clearly inside
+    def test_ability_can_exceed_one(self):
+        m = self._make(ability=5.0)
+        assert m.ability == 5.0
+
+    def test_perception_inside(self):
+        m = self._make(location=np.array([0.5, 0.5]), theorem_radius=0.3)
         assert m.can_perceive_theorem(np.array([0.7, 0.5]))    # dist=0.2
-        # Clearly outside
+
+    def test_perception_outside(self):
+        m = self._make(location=np.array([0.5, 0.5]), theorem_radius=0.3)
         assert not m.can_perceive_theorem(np.array([0.9, 0.5]))  # dist=0.4
+
+    def test_gossip_buffer_filters_generator(self):
+        from model.mathematician import InfoPacket, ProofAttempt
+        m = self._make()
+        packet_own = InfoPacket(
+            content=ProofAttempt("N", "T1", True),
+            generator_id="N",
+        )
+        packet_other = InfoPacket(
+            content=ProofAttempt("P", "T2", False),
+            generator_id="P",
+        )
+        m.gossip_buffer = [packet_own, packet_other]
+        # When sending to N, exclude packets generated by N
+        to_send = m.packets_to_send("N")
+        assert packet_own not in to_send
+        assert packet_other in to_send
 
 
 # -----------------------------------------------------------------------
@@ -122,8 +157,8 @@ class TestMathematician:
 # -----------------------------------------------------------------------
 
 class TestMathematicalWorld:
-    def _theorem(self, tid, loc, diff=0.5, imp=0.5):
-        return Theorem(theorem_id=tid, location=np.array(loc), difficulty=diff, importance=imp)
+    def _theorem(self, tid, loc, diff=0.5):
+        return Theorem(theorem_id=tid, location=np.array(loc), difficulty=diff)
 
     def _mathematician(self, mid, loc, ability=0.5, t_radius=0.4, p_radius=0.4):
         return Mathematician(
@@ -146,20 +181,44 @@ class TestMathematicalWorld:
         w.add_mathematician(self._mathematician("M1", [0.1, 0.1], t_radius=0.1))
         assert "T1" not in w.mathematicians["M1"].theorem_beliefs
 
-    def test_peer_beliefs_added_bidirectionally(self):
+    def test_theorem_beliefs_use_normal_belief(self):
+        w = MathematicalWorld()
+        w.add_theorem(self._theorem("T1", [0.5, 0.5]))
+        w.add_mathematician(self._mathematician("M1", [0.5, 0.5]))
+        tb = w.mathematicians["M1"].theorem_beliefs["T1"]
+        assert isinstance(tb.importance, NormalBelief)
+        assert isinstance(tb.difficulty, NormalBelief)
+
+    def test_peer_beliefs_bidirectional(self):
         w = MathematicalWorld()
         w.add_mathematician(self._mathematician("A", [0.3, 0.3]))
         w.add_mathematician(self._mathematician("B", [0.4, 0.4]))  # dist ≈ 0.14
         assert "B" in w.mathematicians["A"].peer_beliefs
         assert "A" in w.mathematicians["B"].peer_beliefs
 
+    def test_peer_beliefs_use_normal_belief(self):
+        w = MathematicalWorld()
+        w.add_mathematician(self._mathematician("A", [0.3, 0.3]))
+        w.add_mathematician(self._mathematician("B", [0.4, 0.4]))
+        assert isinstance(w.mathematicians["A"].peer_beliefs["B"], NormalBelief)
+
     def test_implication_bidirectional(self):
         w = MathematicalWorld()
-        w.add_theorem(self._theorem("T1", [0.2, 0.2]))
-        w.add_theorem(self._theorem("T2", [0.8, 0.8]))
+        w.add_theorem(self._theorem("T1", [0.2, 0.2], diff=1.0))
+        w.add_theorem(self._theorem("T2", [0.8, 0.8], diff=0.0))
         w.add_implication("T1", "T2")
         assert "T2" in w.theorems["T1"].implies
         assert "T1" in w.theorems["T2"].implied_by
+
+    def test_record_discovery(self):
+        w = MathematicalWorld()
+        w.add_theorem(self._theorem("T1", [0.2, 0.2]))
+        w.add_theorem(self._theorem("T2", [0.3, 0.3]))
+        w.add_implication("T1", "T2")
+        w.add_mathematician(self._mathematician("M1", [0.2, 0.2]))
+        w.record_discovery("M1", "T1", "T2")
+        assert ("T1", "T2") in w.known_implications
+        assert ("T1", "T2") in w.mathematicians["M1"].known_implications
 
     def test_duplicate_theorem_raises(self):
         w = MathematicalWorld()
@@ -178,3 +237,71 @@ class TestMathematicalWorld:
         w.add_theorem(self._theorem("T2", [0.9, 0.9]))
         near = w.theorems_near(np.array([0.1, 0.1]), radius=0.2)
         assert len(near) == 1 and near[0].theorem_id == "T1"
+
+    def test_community_importance(self):
+        w = MathematicalWorld()
+        w.add_theorem(self._theorem("T1", [0.5, 0.5]))
+        w.add_mathematician(self._mathematician("M1", [0.5, 0.5]))
+        # Initial belief is 0.0 (NormalBelief default mu=0)
+        assert w.community_importance("T1") == pytest.approx(0.0)
+
+
+# -----------------------------------------------------------------------
+# Dynamics
+# -----------------------------------------------------------------------
+
+class TestDynamics:
+    def _build_world(self):
+        w = MathematicalWorld()
+        w.add_theorem(Theorem("T1", np.array([0.2, 0.2]), difficulty=1.0))
+        w.add_theorem(Theorem("T2", np.array([0.3, 0.3]), difficulty=0.0))
+        w.add_implication("T1", "T2")  # T1 harder, implies T2
+        w.add_mathematician(Mathematician(
+            mathematician_id="M1",
+            location=np.array([0.25, 0.25]),
+            ability=0.5,
+            theorem_radius=0.3,
+            peer_radius=0.4,
+        ))
+        w.add_mathematician(Mathematician(
+            mathematician_id="M2",
+            location=np.array([0.4, 0.4]),
+            ability=0.0,
+            theorem_radius=0.3,
+            peer_radius=0.4,
+        ))
+        return w
+
+    def test_step_runs_without_error(self):
+        w = self._build_world()
+        params = SimParams()
+        rng = np.random.default_rng(0)
+        step(w, params, rng)  # should not raise
+
+    def test_step_spawns_entities(self):
+        w = self._build_world()
+        params = SimParams()
+        rng = np.random.default_rng(0)
+        n_theorems_before = len(w.theorems)
+        step(w, params, rng)
+        assert len(w.theorems) >= n_theorems_before  # at least one spawned
+
+    def test_difficulty_belief_updates(self):
+        w = self._build_world()
+        params = SimParams()
+        rng = np.random.default_rng(1)
+        prior_var = w.mathematicians["M1"].theorem_beliefs.get("T1")
+        if prior_var:
+            old_sigma2 = prior_var.difficulty.sigma2
+            step(w, params, rng)
+            # Variance should have decreased after update
+            new_tb = w.mathematicians["M1"].theorem_beliefs.get("T1")
+            if new_tb:
+                assert new_tb.difficulty.sigma2 <= old_sigma2
+
+    def test_multiple_steps_run_without_error(self):
+        w = self._build_world()
+        params = SimParams()
+        rng = np.random.default_rng(42)
+        for _ in range(10):
+            step(w, params, rng)

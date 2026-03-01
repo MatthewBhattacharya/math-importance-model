@@ -6,32 +6,38 @@ Theorem class for the mathematical world model.
 # ============================================================
 # MD-T1: MATHEMATICAL SPACE
 #   Theorems live in the unit square [0,1]×[0,1].
-#   Proximity in this space represents conceptual similarity / topical closeness
-#   (e.g., two number-theory theorems would cluster together).
-#   Alternative: higher-dimensional space, hyperbolic space (for hierarchical
-#   topic trees), or discrete topic categories.
+#   Proximity = conceptual/topical similarity.
+#   Alternative: higher-dimensional, hyperbolic, discrete topic categories.
 #
 # MD-T2: DISTANCE METRIC
 #   Euclidean distance in [0,1]×[0,1].
-#   Alternative: L1 (Manhattan), hyperbolic distance, cosine similarity.
+#   Alternative: L1, hyperbolic, cosine similarity.
 #
-# MD-T3: DIFFICULTY IS IN [0,1]
-#   Difficulty is a real number in [0,1]. 0 = trivial, 1 = currently intractable.
-#   Rationale: Bounded domain allows Beta-distribution beliefs; normalisation
-#   simplifies comparison across theorems.
-#   Alternative: unbounded positive real (log-normal prior), ordinal scale.
+# MD-T3: DIFFICULTY IS AN UNBOUNDED REAL
+#   Difficulty is any real number. No lower or upper bound.
+#   Positive = hard, negative = trivial, 0 = "average".
+#   Rationale: allows a Gaussian prior (Normal(0, σ²)) on difficulty and
+#   a clean sigmoid success-probability function of (ability − difficulty).
+#   Alternative: bounded [0,1] (previous version), log-normal (positive only).
 #
-# MD-T4: IMPORTANCE IS IN [0,1] (LATENT GROUND TRUTH)
-#   Importance is the hidden quantity that mathematicians try to estimate.
-#   It represents "how fundamentally significant" the theorem is to mathematics.
-#   Mathematicians hold Beta beliefs over this; it is never directly revealed.
-#   Alternative: importance emerges solely from implication structure (PageRank-like).
+# MD-T4: NO GROUND-TRUTH IMPORTANCE
+#   Theorems do NOT have an intrinsic importance value.
+#   Importance is entirely a collective belief held by mathematicians.
+#   The dynamics model how these beliefs form and propagate.
+#   Alternative: derive importance from the implication graph (PageRank-like).
 #
 # MD-T5: IMPLICATION IS A DIRECTED GRAPH (ADJACENCY LISTS)
 #   Each theorem stores two lists: theorems it implies and theorems that imply it.
-#   This is a redundant bidirectional adjacency list for fast lookup in both directions.
-#   No cycle detection is enforced, but the intended structure is a DAG.
-#   Alternative: a separate NetworkX graph object; edge-weighted implications.
+#   Bidirectional adjacency for fast traversal in both directions.
+#   No cycle detection; intended structure is a DAG.
+#   Alternative: separate NetworkX graph object; weighted edges.
+#
+# MD-T6: DIFFICULTY MONOTONICITY IN IMPLICATION
+#   When creating implications (especially during spawning), a theorem
+#   of lower difficulty is never allowed to imply one of higher difficulty.
+#   Rationale: models the intuition that powerful/harder results imply
+#   simpler corollaries. Enforced by the spawning logic in dynamics.py.
+#   Alternative: allow any direction; use difficulty difference as a weight.
 # ============================================================
 """
 
@@ -46,20 +52,21 @@ class Theorem:
     Represents a mathematical theorem in 2D mathematical space.
 
     Attributes:
-        theorem_id:  Unique string identifier (e.g. "Fermat_Last", "T1").
+        theorem_id:  Unique string identifier.
         location:    2D position in [0,1]×[0,1]. See MD-T1, MD-T2.
-        difficulty:  Ground-truth difficulty in [0,1]. See MD-T3.
-        importance:  Ground-truth importance in [0,1]. Latent; see MD-T4.
-        implies:     IDs of theorems directly implied by this one. See MD-T5.
+        difficulty:  Ground-truth difficulty (unbounded real). See MD-T3.
+                     Unknown to mathematicians; they form NormalBelief about it.
+        implies:     IDs of theorems directly implied by this one. See MD-T5, MD-T6.
         implied_by:  IDs of theorems that directly imply this one. See MD-T5.
+
+    Note: there is NO importance field. See MD-T4.
     """
 
     theorem_id: str
-    location: np.ndarray   # shape (2,); MD-T1
-    difficulty: float       # ∈ [0,1]; MD-T3
-    importance: float       # ∈ [0,1]; MD-T4
+    location: np.ndarray   # shape (2,), values in [0,1]×[0,1]
+    difficulty: float       # unbounded real; MD-T3
 
-    # MD-T5: adjacency lists for the implication DAG
+    # MD-T5: directed implication adjacency lists
     implies: List[str] = field(default_factory=list)
     implied_by: List[str] = field(default_factory=list)
 
@@ -67,10 +74,10 @@ class Theorem:
         self.location = np.asarray(self.location, dtype=float)
         if self.location.shape != (2,):
             raise ValueError("location must be a 2-element array.")
-        if not (0.0 <= self.difficulty <= 1.0):
-            raise ValueError(f"difficulty must be in [0,1], got {self.difficulty}")
-        if not (0.0 <= self.importance <= 1.0):
-            raise ValueError(f"importance must be in [0,1], got {self.importance}")
+        # MD-T3: difficulty is unbounded — no range check performed.
+        # MD-T1: locations must lie in [0,1]×[0,1].
+        if not (np.all(self.location >= 0.0) and np.all(self.location <= 1.0)):
+            raise ValueError(f"location {self.location} is outside [0,1]×[0,1].")
 
     # ------------------------------------------------------------------
     # Geometry
@@ -103,6 +110,6 @@ class Theorem:
         return (
             f"Theorem(id={self.theorem_id!r}, "
             f"loc=({self.location[0]:.2f}, {self.location[1]:.2f}), "
-            f"diff={self.difficulty:.2f}, imp={self.importance:.2f}, "
+            f"diff={self.difficulty:.2f}, "
             f"implies={self.implies}, implied_by={self.implied_by})"
         )

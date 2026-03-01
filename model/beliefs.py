@@ -1,124 +1,126 @@
 """
-Bayesian belief distributions for the mathematical world model.
+NormalBelief — Bayesian belief about an unbounded real-valued parameter.
 
 # ============================================================
 # MODELING DECISIONS
 # ============================================================
 # MD-B1: BELIEF REPRESENTATION
-#   Each uncertain parameter is represented as a Beta distribution Beta(α, β).
-#   Rationale: Beta is the canonical distribution on [0,1], flexible (spans
-#   U-shaped, uniform, unimodal), and is the conjugate prior for Bernoulli
-#   and Binomial likelihoods, making Bayesian updates analytically clean.
-#   Alternatives considered: truncated Normal, Kumaraswamy.
+#   Each uncertain parameter (theorem difficulty, theorem importance,
+#   peer ability) is represented as a Normal distribution N(μ, σ²).
+#   Rationale: natural distribution on ℝ; conjugate to a Gaussian
+#   likelihood; μ and σ² are directly interpretable as "best estimate"
+#   and "uncertainty". Supports negative values (e.g. negative difficulty
+#   meaning "trivially easy").
+#   Alternatives: Laplace, Student-t (heavier tails), log-Normal (for
+#   strictly positive parameters).
 #
 # MD-B2: DEFAULT (UNINFORMATIVE) PRIOR
-#   Alpha = beta_ = 1.0, giving Beta(1,1) = Uniform[0,1].
-#   Rationale: Maximum entropy on [0,1]; no bias before any evidence.
-#   Alternative: Jeffrey's prior Beta(0.5, 0.5), which is "less informative"
-#   in a formal sense but has mass at the boundaries.
+#   μ₀ = PRIOR_MU (default 0.0), σ₀² = PRIOR_SIGMA2 (default 4.0).
+#   A large variance represents near-ignorance before any evidence.
+#   Alternative: Jeffreys prior (improper flat), or informative priors
+#   derived from community statistics.
 #
-# MD-B3: BELIEF UPDATE RULE
-#   Given an observation x ∈ [0,1] with confidence weight w:
-#       α ← α + w * x
-#       β ← β + w * (1 − x)
-#   This is exact conjugate Bayesian updating when the likelihood is
-#   Bernoulli(x) (treating x as a sufficient statistic). For continuous
-#   observations it is a pseudo-count / moment-matching approximation.
-#   Alternative: full likelihood specification with a custom update.
+# MD-B3: UPDATE RULE — Normal-Normal conjugate
+#   Given an observation x with known noise variance σ_obs²:
+#       precision_prior = 1 / σ_prior²
+#       precision_obs   = 1 / σ_obs²
+#       precision_post  = precision_prior + precision_obs
+#       μ_post          = (precision_prior·μ_prior + precision_obs·x) / precision_post
+#       σ²_post         = 1 / precision_post
+#   This is the exact conjugate Bayesian update for a Gaussian likelihood
+#   with known noise. Observations are precision-weighted: a precise
+#   (low-noise) observation shifts the mean more than a noisy one.
+#   Alternative: moment-matching, variational Bayes, Kalman filter.
 # ============================================================
 """
 
 import numpy as np
 from dataclasses import dataclass
 
+# Defaults — see MD-B2 and params.py MD-C01, MD-C02
+_DEFAULT_MU: float = 0.0
+_DEFAULT_SIGMA2: float = 4.0
+
 
 @dataclass
-class BetaBelief:
+class NormalBelief:
     """
-    A Bayesian belief about a single parameter in [0,1], as a Beta(α, β) distribution.
+    A Bayesian belief about a single unbounded real parameter, stored as N(μ, σ²).
 
     Attributes:
-        alpha:  First shape parameter (α > 0). Encodes pseudo-count of "high" observations.
-        beta_:  Second shape parameter (β > 0). Encodes pseudo-count of "low" observations.
+        mu:     Posterior mean — current best estimate of the parameter.
+        sigma2: Posterior variance — uncertainty (must be > 0).
 
-    See module docstring for modeling decisions (MD-B1, MD-B2, MD-B3).
+    See module docstring for MD-B1, MD-B2, MD-B3.
     """
 
-    # MD-B2: default uninformative prior Beta(1,1)
-    alpha: float = 1.0
-    beta_: float = 1.0
+    mu: float = _DEFAULT_MU       # MD-B2: initial mean (see also params.py MD-C01)
+    sigma2: float = _DEFAULT_SIGMA2  # MD-B2: initial variance (see also params.py MD-C02)
 
     def __post_init__(self) -> None:
-        if self.alpha <= 0 or self.beta_ <= 0:
-            raise ValueError(f"Both alpha and beta_ must be > 0, got α={self.alpha}, β={self.beta_}")
+        if self.sigma2 <= 0:
+            raise ValueError(f"sigma2 must be > 0, got {self.sigma2}")
 
     # ------------------------------------------------------------------
     # Summary statistics
     # ------------------------------------------------------------------
 
     def mean(self) -> float:
-        """Expected value of the distribution: α / (α + β)."""
-        return self.alpha / (self.alpha + self.beta_)
+        """Best estimate of the parameter (posterior mean)."""
+        return self.mu
 
     def variance(self) -> float:
-        """Variance: αβ / [(α+β)²(α+β+1)]."""
-        a, b = self.alpha, self.beta_
-        return (a * b) / ((a + b) ** 2 * (a + b + 1))
+        """Posterior variance — proxy for remaining uncertainty."""
+        return self.sigma2
 
-    def mode(self) -> float:
-        """
-        Mode: (α−1) / (α+β−2), defined only when α > 1 and β > 1.
-        Falls back to mean when the mode is undefined (flat or U-shaped distribution).
+    def std(self) -> float:
+        """Posterior standard deviation."""
+        return float(np.sqrt(self.sigma2))
 
-        # MD-B4 (constant): Fall back to mean — not the boundaries — when mode is
-        # undefined, to avoid degenerate point estimates during early simulation steps.
-        """
-        if self.alpha > 1 and self.beta_ > 1:
-            return (self.alpha - 1) / (self.alpha + self.beta_ - 2)
-        return self.mean()  # MD-B4 fallback
-
-    def concentration(self) -> float:
-        """Total pseudo-count α + β, a proxy for certainty/experience."""
-        return self.alpha + self.beta_
+    def precision(self) -> float:
+        """Posterior precision = 1/σ². Higher → more certain."""
+        return 1.0 / self.sigma2
 
     # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
 
     def sample(self, n: int = 1) -> np.ndarray:
-        """Draw n independent samples from Beta(α, β)."""
-        return np.random.beta(self.alpha, self.beta_, size=n)
+        """Draw n independent samples from N(μ, σ²)."""
+        return np.random.normal(self.mu, self.std(), size=n)
 
     # ------------------------------------------------------------------
-    # Bayesian update
+    # Bayesian update (MD-B3)
     # ------------------------------------------------------------------
 
-    def update(self, observation: float, weight: float = 1.0) -> None:
+    def update(self, observation: float, obs_noise2: float) -> None:
         """
-        Update belief in-place given a new observation in [0,1].
-
-        Uses the pseudo-count update rule described in MD-B3.
+        In-place Normal-Normal conjugate update.
 
         Args:
-            observation: Observed value in [0, 1].
-            weight:      Confidence / trust in the observation (default 1.0).
-                         # MD-B5 (constant): Default weight = 1.0 (full trust).
-                         # Reduce this to model noisy or second-hand evidence.
+            observation: Observed value (unbounded real).
+            obs_noise2:  Known observation noise variance σ_obs² > 0.
+                         Smaller → observation is trusted more.
+                         See params.py MD-C03 through MD-C06 for default values.
+
+        Raises:
+            ValueError: if obs_noise2 ≤ 0.
         """
-        if not (0.0 <= observation <= 1.0):
-            raise ValueError(f"Observation must be in [0,1], got {observation}")
-        if weight < 0:
-            raise ValueError(f"Weight must be non-negative, got {weight}")
-        self.alpha += weight * observation
-        self.beta_ += weight * (1.0 - observation)
+        if obs_noise2 <= 0:
+            raise ValueError(f"obs_noise2 must be > 0, got {obs_noise2}")
+        prec_prior = 1.0 / self.sigma2
+        prec_obs = 1.0 / obs_noise2
+        prec_post = prec_prior + prec_obs
+        self.mu = (prec_prior * self.mu + prec_obs * observation) / prec_post
+        self.sigma2 = 1.0 / prec_post
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
-    def copy(self) -> "BetaBelief":
-        """Return a deep copy of this belief."""
-        return BetaBelief(alpha=self.alpha, beta_=self.beta_)
+    def copy(self) -> "NormalBelief":
+        """Return an independent copy."""
+        return NormalBelief(mu=self.mu, sigma2=self.sigma2)
 
     def __repr__(self) -> str:
-        return f"Beta(α={self.alpha:.3f}, β={self.beta_:.3f}  mean={self.mean():.3f}, var={self.variance():.4f})"
+        return f"Normal(μ={self.mu:.3f}, σ={self.std():.3f})"

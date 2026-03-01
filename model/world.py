@@ -1,42 +1,38 @@
 """
-MathematicalWorld: the simulation container.
+MathematicalWorld — simulation container and coordinator.
 
 # ============================================================
 # MODELING DECISIONS
 # ============================================================
 # MD-W1: SPACE IS [0,1]×[0,1]
-#   The world is the unit square. All locations must lie within it.
-#   Alternative: torus (to avoid boundary effects), higher-dimensional space.
+#   All entity locations must lie in the unit square.
+#   Alternative: torus (no boundary effects), larger bounding box.
 #
 # MD-W2: BELIEF INITIALISATION TIMING
-#   When an entity is added to the world, all relevant beliefs are
-#   initialised immediately (not lazily at first interaction).
-#   Rationale: simpler; matches the idea that mathematicians are
-#   continuously aware of everything in their radius.
-#   Alternative: beliefs initialised only at the first time step in which
-#   the mathematician "actively looks around."
+#   Beliefs are initialised immediately when an entity is added.
+#   Alternative: lazy initialisation at the first time step.
 #
-# MD-W3: MUTUAL AWARENESS ON MATHEMATICIAN ADDITION
-#   When a new mathematician M is added, any existing mathematician P
-#   who is within P's peer_radius of M will gain a belief entry for M.
-#   Awareness is not necessarily symmetric (P's peer_radius may ≠ M's).
-#   Alternative: awareness requires both parties to be within each other's
-#   radius (symmetric / mutual).
+# MD-W3: ASYMMETRIC PEER AWARENESS
+#   When new mathematician M is added, existing peer P gains a belief
+#   about M if M ∈ P's peer_radius — regardless of M's own peer_radius.
+#   Alternative: symmetric (both must be within each other's radius).
 #
-# MD-W4: IMPLICATION IS A DIRECTED RELATION
-#   add_implication(A, B) means "A implies B" (A → B in the DAG).
-#   No cycle detection is enforced; cycles would be logically inconsistent
-#   but the model does not prevent them.
-#   Alternative: enforce DAG by topological sort; weight implications by strength.
+# MD-W4: IMPLICATION IS DIRECTED; NO CYCLE DETECTION
+#   add_implication(A, B) records A → B. Cycles are not prevented.
+#   Alternative: enforce DAG by topological sort.
+#
+# MD-W5: COMMUNITY KNOWLEDGE TRACKING
+#   world.known_implications tracks every implication discovered by ANY
+#   mathematician. This is separate from individual mathematician knowledge.
 # ============================================================
 """
 
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
 from .theorem import Theorem
 from .mathematician import Mathematician, TheoremBeliefs
-from .beliefs import BetaBelief
+from .beliefs import NormalBelief
 
 
 class MathematicalWorld:
@@ -47,12 +43,20 @@ class MathematicalWorld:
       - Store and index entities by ID.
       - Initialise Bayesian beliefs on entity arrival (MD-W2, MD-W3).
       - Manage the implication graph (MD-W4).
+      - Track community-level discovered implications (MD-W5).
       - Provide neighbourhood queries.
     """
 
     def __init__(self) -> None:
         self.theorems: Dict[str, Theorem] = {}
         self.mathematicians: Dict[str, Mathematician] = {}
+
+        # MD-W5: community knowledge — any implication discovered by at least one mathematician
+        self.known_implications: Set[Tuple[str, str]] = set()
+
+        # Monotonically increasing counters for auto-naming spawned entities
+        self._theorem_counter: int = 0
+        self._mathematician_counter: int = 0
 
     # ------------------------------------------------------------------
     # Adding entities
@@ -62,18 +66,18 @@ class MathematicalWorld:
         """
         Add a theorem to the world.
 
-        After insertion, any existing mathematician whose theorem_radius
-        covers the new theorem gets an uninformative prior over it. (MD-W2)
+        Initialises uninformative beliefs in all existing mathematicians who
+        can perceive the new theorem (MD-W2).
 
         Raises:
-            ValueError: if theorem_id is already registered.
+            ValueError: if theorem_id is already registered or location out of bounds.
         """
         if theorem.theorem_id in self.theorems:
             raise ValueError(f"Theorem '{theorem.theorem_id}' already exists.")
         self._validate_location(theorem.location, label=f"Theorem {theorem.theorem_id}")
         self.theorems[theorem.theorem_id] = theorem
 
-        # MD-W2: initialise beliefs for all existing mathematicians in range
+        # MD-W2: initialise beliefs for existing mathematicians in range
         for m in self.mathematicians.values():
             if m.can_perceive_theorem(theorem.location):
                 if theorem.theorem_id not in m.theorem_beliefs:
@@ -83,18 +87,15 @@ class MathematicalWorld:
         """
         Add a mathematician to the world.
 
-        Initialises:
-          - Their theorem_beliefs for all theorems within theorem_radius.
-          - Their peer_beliefs for all existing mathematicians within peer_radius.
-          - peer_beliefs of existing mathematicians who can perceive the newcomer. (MD-W3)
+        Initialises their beliefs over all existing entities within their radii,
+        and updates existing mathematicians' peer beliefs if appropriate (MD-W2, MD-W3).
 
         Raises:
-            ValueError: if mathematician_id is already registered.
+            ValueError: if mathematician_id is already registered or location out of bounds.
         """
         if mathematician.mathematician_id in self.mathematicians:
             raise ValueError(f"Mathematician '{mathematician.mathematician_id}' already exists.")
         self._validate_location(mathematician.location, label=f"Mathematician {mathematician.mathematician_id}")
-
         self.mathematicians[mathematician.mathematician_id] = mathematician
 
         # MD-W2: initialise newcomer's theorem beliefs
@@ -102,19 +103,19 @@ class MathematicalWorld:
             if mathematician.can_perceive_theorem(theorem.location):
                 mathematician.theorem_beliefs[theorem.theorem_id] = TheoremBeliefs()  # MD-M5
 
-        # MD-W2 + MD-W3: initialise newcomer's peer beliefs, and update peers
+        # MD-W2 + MD-W3: peer belief initialisation (asymmetric)
         for peer in self.mathematicians.values():
             if peer.mathematician_id == mathematician.mathematician_id:
                 continue
 
             # Newcomer's belief about this peer
             if mathematician.can_perceive_peer(peer.location):
-                mathematician.peer_beliefs[peer.mathematician_id] = BetaBelief()  # MD-M5
+                mathematician.peer_beliefs[peer.mathematician_id] = NormalBelief()  # MD-M5
 
             # Peer's belief about the newcomer (MD-W3: not necessarily symmetric)
             if peer.can_perceive_peer(mathematician.location):
                 if mathematician.mathematician_id not in peer.peer_beliefs:
-                    peer.peer_beliefs[mathematician.mathematician_id] = BetaBelief()  # MD-M5
+                    peer.peer_beliefs[mathematician.mathematician_id] = NormalBelief()  # MD-M5
 
     # ------------------------------------------------------------------
     # Implication graph
@@ -122,10 +123,10 @@ class MathematicalWorld:
 
     def add_implication(self, source_id: str, target_id: str) -> None:
         """
-        Record that the theorem `source_id` directly implies `target_id`.
+        Record the ground-truth implication source_id → target_id.
 
-        Updates both the source's `implies` list and the target's `implied_by`
-        list for fast bidirectional traversal. (MD-W4)
+        Updates both theorem adjacency lists (MD-W4).
+        Does NOT mark this as discovered (that happens via dynamics).
 
         Raises:
             ValueError: if either theorem ID is not registered.
@@ -136,6 +137,41 @@ class MathematicalWorld:
             raise ValueError(f"Target theorem '{target_id}' not found.")
         self.theorems[source_id]._add_implies(target_id)
         self.theorems[target_id]._add_implied_by(source_id)
+
+    def record_discovery(self, mathematician_id: str, source_id: str, target_id: str) -> None:
+        """
+        Record that mathematician `mathematician_id` discovered source_id → target_id.
+
+        Updates the mathematician's known_implications and the community set (MD-W5).
+        Does NOT add it to the ground-truth theorem adjacency lists
+        (those are set by add_implication / spawning only).
+        """
+        m = self.mathematicians[mathematician_id]
+        m.known_implications.add((source_id, target_id))
+        self.known_implications.add((source_id, target_id))
+
+    # ------------------------------------------------------------------
+    # Auto-naming helpers for spawned entities
+    # ------------------------------------------------------------------
+
+    def next_theorem_id(self) -> str:
+        """Return a unique theorem ID for a spawned theorem (prefix 'Ts' avoids collisions with manually-named theorems)."""
+        self._theorem_counter += 1
+        tid = f"Ts{self._theorem_counter}"
+        # Guarantee uniqueness even if caller uses the same prefix
+        while tid in self.theorems:
+            self._theorem_counter += 1
+            tid = f"Ts{self._theorem_counter}"
+        return tid
+
+    def next_mathematician_id(self) -> str:
+        """Return a unique mathematician ID for a spawned mathematician (prefix 'Ms')."""
+        self._mathematician_counter += 1
+        mid = f"Ms{self._mathematician_counter}"
+        while mid in self.mathematicians:
+            self._mathematician_counter += 1
+            mid = f"Ms{self._mathematician_counter}"
+        return mid
 
     # ------------------------------------------------------------------
     # Neighbourhood queries
@@ -151,56 +187,80 @@ class MathematicalWorld:
         loc = np.asarray(location, dtype=float)
         return [m for m in self.mathematicians.values() if m.distance_to(loc) <= radius]
 
+    def nearest_mathematicians(self, mathematician_id: str, n: int) -> List[Mathematician]:
+        """
+        Return the n closest OTHER mathematicians to the given one, by Euclidean distance.
+        Used to find communication neighbours (MD-C16 in params.py).
+        """
+        m = self.mathematicians[mathematician_id]
+        others = [p for p in self.mathematicians.values() if p.mathematician_id != mathematician_id]
+        others.sort(key=lambda p: m.distance_to(p.location))
+        return others[:n]
+
     # ------------------------------------------------------------------
-    # Validation helpers
+    # Aggregate statistics (for visualisation / logging)
+    # ------------------------------------------------------------------
+
+    def community_importance(self, theorem_id: str) -> float:
+        """
+        Mean importance belief across all mathematicians who know this theorem.
+
+        Returns 0.0 if no mathematician knows it.
+        """
+        values = [
+            m.theorem_beliefs[theorem_id].importance.mu
+            for m in self.mathematicians.values()
+            if theorem_id in m.theorem_beliefs
+        ]
+        return float(np.mean(values)) if values else 0.0
+
+    def community_difficulty(self, theorem_id: str) -> float:
+        """Mean difficulty belief across all mathematicians who know this theorem."""
+        values = [
+            m.theorem_beliefs[theorem_id].difficulty.mu
+            for m in self.mathematicians.values()
+            if theorem_id in m.theorem_beliefs
+        ]
+        return float(np.mean(values)) if values else 0.0
+
+    # ------------------------------------------------------------------
+    # Validation
     # ------------------------------------------------------------------
 
     def _validate_location(self, location: np.ndarray, label: str = "") -> None:
         """
-        Check that a location lies within [0,1]×[0,1]. (MD-W1)
-
-        # MD-W1 (constant): Locations outside [0,1]×[0,1] are rejected.
-        # If you want a larger or toroidal space, change the bounds here.
+        Reject locations outside [0,1]×[0,1]. MD-W1.
+        To change the space, modify the bounds here.
         """
         if not (np.all(location >= 0.0) and np.all(location <= 1.0)):
-            raise ValueError(
-                f"{label} location {location} is outside [0,1]×[0,1]. (MD-W1)"
-            )
+            raise ValueError(f"{label} location {location} is outside [0,1]×[0,1]. (MD-W1)")
 
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
 
     def summary(self) -> str:
-        """Return a human-readable snapshot of the world."""
+        """Human-readable snapshot of the world state."""
         lines = [
-            f"MathematicalWorld: {len(self.theorems)} theorem(s), "
-            f"{len(self.mathematicians)} mathematician(s)",
+            f"MathematicalWorld: {len(self.theorems)} theorems, "
+            f"{len(self.mathematicians)} mathematicians, "
+            f"{len(self.known_implications)} known implications",
             "",
             "--- Theorems ---",
         ]
         for t in self.theorems.values():
-            lines.append(f"  {t}")
-
+            lines.append(
+                f"  {t}  community_imp={self.community_importance(t.theorem_id):.2f}"
+            )
         lines += ["", "--- Mathematicians ---"]
         for m in self.mathematicians.values():
             lines.append(f"  {m}")
-            for tid, tb in m.theorem_beliefs.items():
-                lines.append(
-                    f"      belief[{tid}]: "
-                    f"imp={tb.importance.mean():.2f}±{tb.importance.variance():.4f}  "
-                    f"diff={tb.difficulty.mean():.2f}±{tb.difficulty.variance():.4f}"
-                )
-            for pid, pb in m.peer_beliefs.items():
-                lines.append(
-                    f"      belief[peer {pid}]: "
-                    f"ability={pb.mean():.2f}±{pb.variance():.4f}"
-                )
         return "\n".join(lines)
 
     def __repr__(self) -> str:
         return (
             f"MathematicalWorld("
             f"theorems={len(self.theorems)}, "
-            f"mathematicians={len(self.mathematicians)})"
+            f"mathematicians={len(self.mathematicians)}, "
+            f"known_implications={len(self.known_implications)})"
         )
