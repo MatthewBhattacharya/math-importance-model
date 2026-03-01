@@ -115,6 +115,7 @@ Directed; stored as adjacency lists on each Theorem. Ground truth is fixed once 
 | **MD-B3** | `beliefs.py` | **Normal-Normal conjugate update** (precision-weighted) | Moment matching, variational Bayes |
 | **MD-G1** | `mathematician.py`, `dynamics.py` | **Gossip**: relay last-step received info, excluding info back to generator | Track full relay chain; depth cutoff |
 | **MD-G2** | `mathematician.py` | Link discovery is of **pre-existing ground-truth implications** | Mathematicians create new implications |
+| **MD-G3** | `mathematician.py`, `dynamics.py` | **Receiver-side deduplication**: each piece of evidence updates beliefs exactly once per receiver regardless of how many gossip paths delivered it | Sender-side deduplication (more complex) |
 
 ### Dynamics — Phase 1 (Proof Attempts)
 
@@ -134,7 +135,7 @@ Directed; stored as adjacency lists on each Theorem. Ground truth is fixed once 
 | **MD-C1** | `dynamics.py` | Communicate with **COMMUNICATION\_PEERS = 3** nearest neighbours | All within radius; random sample |
 | **MD-C2** | `dynamics.py` | Peer ability update: **pseudo-obs = difficulty\_belief ± failure\_offset** | Probit likelihood update |
 | **MD-C3** | `dynamics.py` | Difficulty update from peer result: use **peer's believed ability** as signal | Use ground truth (information unavailable in practice) |
-| **MD-C4** | `dynamics.py` | Importance of X, Y updated when X→Y communicated: **noise ∝ 1/sigmoid(ability\_belief)** | Fixed noise; discount by certainty |
+| **MD-C4** | `dynamics.py` | Importance update noise propagates evidence uncertainty: **eff\_noise\_X = (OBS\_NOISE\_IMPORTANCE + σ²\_Y) / sigmoid(ability\_mu)** — weak beliefs about Y give a weak update to X | Fixed noise; full joint update |
 
 ### Dynamics — Phase 3 (Spawning)
 

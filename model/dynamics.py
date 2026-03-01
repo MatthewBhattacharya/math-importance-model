@@ -94,12 +94,20 @@ through three sequential phases:
 #
 # --- Phase 2: Importance update from link discovery ---
 # MD-C4: IMPORTANCE UPDATE WHEN X→Y IS COMMUNICATED
+#   Each link is incorporated into beliefs exactly ONCE per receiver (MD-G3).
+#
 #   Pseudo-obs for importance(X) = importance_belief(Y).mu + IMPLICATION_BONUS
 #     (X implies Y, so X is at least as important as Y + a bonus.)
 #   Pseudo-obs for importance(Y) = importance_belief(X).mu * CONSEQUENCE_FACTOR
 #     (Y gains some of X's importance for being a consequence of it.)
-#   Noise: OBS_NOISE_IMPORTANCE / (1 + exp(−ability_belief(M).mu))
-#     (Higher believed ability of the discoverer → more trustworthy signal.)
+#
+#   Effective noise (Bayesian propagation of evidence uncertainty):
+#     eff_noise_X = (OBS_NOISE_IMPORTANCE + σ²_Y) / sigmoid(ability_mu)
+#     eff_noise_Y = (OBS_NOISE_IMPORTANCE + CONSEQUENCE_FACTOR² × σ²_X) / sigmoid(ability_mu)
+#   Rationale: the observation signal for X's importance uses μ_Y, which is itself
+#   uncertain (variance σ²_Y). Treating μ_Y as a noiseless observation would
+#   overcount evidence. Adding σ²_Y to the noise correctly propagates that uncertainty.
+#   The sigmoid divisor makes the update stronger for trusted (high-ability) discoverers.
 #   Alternative: update only X; treat implication as one-directional importance signal.
 #
 # --- Phase 3: Spawning ---
@@ -378,10 +386,20 @@ def _update_from_proof(
     Receiver updates beliefs about theorem difficulty and peer ability
     given knowledge that mathematician `attempt.mathematician_id` succeeded
     or failed on theorem `attempt.theorem_id`. MD-C2, MD-C3.
+
+    MD-G3: Each (mathematician_id, theorem_id) proof result is incorporated
+    at most once per receiver. If the same result arrives via multiple gossip
+    paths, only the first triggers a belief update.
     """
     tid = attempt.theorem_id
     mid = attempt.mathematician_id
     success = attempt.success
+
+    # MD-G3: deduplication — skip if this result was already processed
+    proof_key = (mid, tid)
+    if proof_key in receiver.processed_proofs:
+        return
+    receiver.processed_proofs.add(proof_key)
 
     # ---- Difficulty update (MD-C3) ----
     # Only possible if receiver knows this theorem
@@ -431,53 +449,73 @@ def _update_from_link(
     Receiver updates beliefs about the importance of both theorems in
     the newly communicated implication link source → target. MD-C4.
 
-    Also records the link as known to the receiver.
+    MD-G3: belief update only fires the FIRST time this link is received.
+    known_implications serves as the deduplication guard for links.
+
+    MD-C4 (Bayesian noise): the observation signal for X's importance is
+    "μ_Y + IMPLICATION_BONUS", but μ_Y is itself uncertain (variance σ²_Y).
+    The effective observation noise for X's update is therefore:
+        eff_noise_X = (OBS_NOISE_IMPORTANCE + σ²_Y) / sigmoid(ability_mu)
+    and symmetrically for Y:
+        eff_noise_Y = (OBS_NOISE_IMPORTANCE + CONSEQUENCE_FACTOR² × σ²_X) / sigmoid(ability_mu)
+    This propagates the uncertainty of the evidence source into the update,
+    so a weakly-known Y provides only a weak update to X. The sigmoid(ability_mu)
+    divisor means a highly-trusted discoverer produces a stronger (lower-noise)
+    update than a weakly-trusted one.
     """
     sid = link.source_id
     tid = link.target_id
     mid = link.mathematician_id
 
-    # Record discovery for receiver too
-    if (sid, tid) not in receiver.known_implications:
-        receiver.known_implications.add((sid, tid))
-        world.known_implications.add((sid, tid))
+    # MD-G3: deduplication — record discovery and skip belief update if already known
+    if (sid, tid) in receiver.known_implications:
+        return
+    receiver.known_implications.add((sid, tid))
+    world.known_implications.add((sid, tid))
 
     # ---- Importance update (MD-C4) ----
-    # Noise is modulated by believed ability of the discoverer
-    # Higher believed ability → more trustworthy → lower noise
     ability_mu = (
         receiver.peer_beliefs[mid].mu
         if mid in receiver.peer_beliefs
         else params.PRIOR_MU
     )
-    # Transform ability into a noise scaling: more capable → less noise
-    # MD-C4: noise = OBS_NOISE_IMPORTANCE / sigmoid(ability_mu)
-    # sigmoid maps ability to (0,1), avoiding division by zero
-    noise = params.OBS_NOISE_IMPORTANCE / max(_sigmoid(ability_mu), 0.05)
+    # sigmoid(ability_mu) ∈ (0,1): more trusted discoverer → smaller divisor → lower noise
+    trust = max(_sigmoid(ability_mu), 0.05)  # clamp to avoid division blowup
 
     if sid in receiver.theorem_beliefs and tid in receiver.theorem_beliefs:
-        imp_source = receiver.theorem_beliefs[sid].importance.mu
-        imp_target = receiver.theorem_beliefs[tid].importance.mu
+        # Capture old values before any update (use old μ and σ² for both formulas)
+        imp_source_mu    = receiver.theorem_beliefs[sid].importance.mu
+        imp_source_sigma2 = receiver.theorem_beliefs[sid].importance.sigma2
+        imp_target_mu    = receiver.theorem_beliefs[tid].importance.mu
+        imp_target_sigma2 = receiver.theorem_beliefs[tid].importance.sigma2
 
-        # X→Y discovered: X is at least as important as Y (+ bonus)
-        pseudo_source = imp_target + params.IMPLICATION_BONUS  # MD-C17
-        receiver.theorem_beliefs[sid].importance.update(pseudo_source, obs_noise2=noise)
+        # X's update: observation is "importance(X) ≈ importance(Y) + IMPLICATION_BONUS"
+        # Effective noise includes Y's uncertainty (σ²_Y propagated through) — MD-C4
+        pseudo_source = imp_target_mu + params.IMPLICATION_BONUS  # MD-C17
+        eff_noise_source = (params.OBS_NOISE_IMPORTANCE + imp_target_sigma2) / trust
+        receiver.theorem_beliefs[sid].importance.update(pseudo_source, obs_noise2=eff_noise_source)
 
-        # Y gains some of X's importance (weighted by CONSEQUENCE_FACTOR)
-        pseudo_target = imp_source * params.CONSEQUENCE_FACTOR  # MD-C18
-        receiver.theorem_beliefs[tid].importance.update(pseudo_target, obs_noise2=noise)
+        # Y's update: observation is "importance(Y) ≈ importance(X) * CONSEQUENCE_FACTOR"
+        # Effective noise includes X's uncertainty scaled by CONSEQUENCE_FACTOR² — MD-C4
+        pseudo_target = imp_source_mu * params.CONSEQUENCE_FACTOR  # MD-C18
+        eff_noise_target = (params.OBS_NOISE_IMPORTANCE + params.CONSEQUENCE_FACTOR ** 2 * imp_source_sigma2) / trust
+        receiver.theorem_beliefs[tid].importance.update(pseudo_target, obs_noise2=eff_noise_target)
 
     elif sid in receiver.theorem_beliefs:
-        # Receiver only knows source — small boost from knowing it implies something
-        imp_source = receiver.theorem_beliefs[sid].importance.mu
-        pseudo_source = imp_source + params.IMPLICATION_BONUS
-        receiver.theorem_beliefs[sid].importance.update(pseudo_source, obs_noise2=noise)
+        # Only know source: self-referential boost (implies something exists)
+        imp_source_mu     = receiver.theorem_beliefs[sid].importance.mu
+        imp_source_sigma2 = receiver.theorem_beliefs[sid].importance.sigma2
+        pseudo_source = imp_source_mu + params.IMPLICATION_BONUS
+        eff_noise = (params.OBS_NOISE_IMPORTANCE + imp_source_sigma2) / trust
+        receiver.theorem_beliefs[sid].importance.update(pseudo_source, obs_noise2=eff_noise)
 
     elif tid in receiver.theorem_beliefs:
-        # Receiver only knows target — small boost from knowing something implies it
-        imp_target = receiver.theorem_beliefs[tid].importance.mu
-        pseudo_target = imp_target + params.IMPLICATION_BONUS * params.CONSEQUENCE_FACTOR
-        receiver.theorem_beliefs[tid].importance.update(pseudo_target, obs_noise2=noise)
+        # Only know target: small boost from knowing something implies it
+        imp_target_mu     = receiver.theorem_beliefs[tid].importance.mu
+        imp_target_sigma2 = receiver.theorem_beliefs[tid].importance.sigma2
+        pseudo_target = imp_target_mu + params.IMPLICATION_BONUS * params.CONSEQUENCE_FACTOR
+        eff_noise = (params.OBS_NOISE_IMPORTANCE + imp_target_sigma2) / trust
+        receiver.theorem_beliefs[tid].importance.update(pseudo_target, obs_noise2=eff_noise)
 
 
 # ------------------------------------------------------------------
